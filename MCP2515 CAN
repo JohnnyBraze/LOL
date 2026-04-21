@@ -1,0 +1,114 @@
+#include <SPI.h>                 // 引入 SPI 通信库
+#include "mcp_can.h"             // 引入 MCP2515 CAN 库
+#include "USB.h"                 // 引入 USB Host Shield 库
+#include "FAT16.h"               // 引入 FAT16 文件系统库，用于操作 U 盘
+
+// === 引脚定义 ===
+#define CAN_CS_PIN 9             // 根据你的接线，CAN 模块的 CS 接在 D9
+#define CAN_INT_PIN 2            // CAN 模块的中断引脚接在 D2
+#define USB_CS_PIN 10            // USB Host Shield 的 CS 是固定的 D10
+
+// === 全局对象 ===
+MCP_CAN CAN(CAN_CS_PIN);         // 初始化 CAN 对象
+USB usb;                         // 初始化 USB Host Shield 对象
+FAT16 fat;                       // 初始化文件系统对象
+
+// === 变量 ===
+char filename[] = "CANLOG00.TXT"; // 日志文件名
+uint16_t file_number = 0;        // 用于生成新文件名的计数器
+bool sd_available = false;       // U盘是否可用的标志
+
+// === CAN 中断标志 ===
+volatile bool newCANMessage = false; // 使用 volatile 关键字，确保在中断中修改的值能被主循环正确读取
+
+// === CAN 中断服务函数 ===
+void CAN_ISR() {
+  newCANMessage = true;          // 当中断触发时，将标志置为 true
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(CAN_INT_PIN, INPUT_PULLUP); // 将中断引脚设置为输入上拉模式
+  attachInterrupt(digitalPinToInterrupt(CAN_INT_PIN), CAN_ISR, FALLING); // 将中断函数绑定到引脚
+
+  // 1. 初始化 CAN 通信
+  if (CAN.begin(CAN_500KBPS) == CAN_OK) {
+    Serial.println("CAN init ok!");
+  } else {
+    Serial.println("CAN init fail!");
+    while (1);
+  }
+
+  // 2. 初始化 USB Host Shield 并挂载 U 盘
+  if (usb.Init() == 0) {
+    Serial.println("USB Host Shield init ok!");
+    if (fat.init(usb) == 0) {
+      sd_available = true;
+      // 自动生成不重复的文件名
+      while (fat.exists(filename)) {
+        file_number++;
+        sprintf(filename, "CANLOG%02d.TXT", file_number);
+      }
+      fat.open(filename, O_RDWR | O_CREAT);
+      fat.println("Timestamp (ms), CAN ID, Data Length, Data (Hex)");
+      Serial.print("Logging to file: ");
+      Serial.println(filename);
+    } else {
+      Serial.println("Failed to mount USB drive.");
+    }
+  } else {
+    Serial.println("USB Host Shield init fail!");
+  }
+
+  Serial.println("System ready. Waiting for CAN messages...");
+}
+
+void loop() {
+  // 当有新的CAN消息到达时，处理它
+  if (newCANMessage) {
+    newCANMessage = false; // 清除标志
+    processCANMessage();
+  }
+  delay(10);
+}
+
+void processCANMessage() {
+  INT8U len = 0;
+  INT32U id = 0;
+  INT8U buf[8];
+
+  // 从 CAN 模块读取数据
+  if (CAN.readMsgBuf(&len, buf) == CAN_OK) {
+    id = CAN.getCanId();
+    unsigned long timestamp = millis();
+
+    // 如果U盘可用，将数据写入文件
+    if (sd_available) {
+      fat.print(timestamp);
+      fat.print(", 0x");
+      fat.print(id, HEX);
+      fat.print(", ");
+      fat.print(len);
+      fat.print(", ");
+      for (int i = 0; i < len; i++) {
+        if (buf[i] < 0x10) fat.print("0");
+        fat.print(buf[i], HEX);
+        fat.print(" ");
+      }
+      fat.println();
+      fat.flush(); // 强制将缓冲区数据写入U盘
+    }
+
+    // 同时在串口监视器打印数据，便于调试
+    Serial.print(timestamp);
+    Serial.print("ms, ID: 0x");
+    Serial.print(id, HEX);
+    Serial.print(", Data: ");
+    for (int i = 0; i < len; i++) {
+      if (buf[i] < 0x10) Serial.print("0");
+      Serial.print(buf[i], HEX);
+      Serial.print(" ");
+    }
+    Serial.println();
+  }
+}
